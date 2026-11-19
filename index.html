@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#080e14">
 <meta name="description" content="Администрация сервера Ялта — Live Russia">
 <title>Сервер Ялта · Live Russia</title>
-<script type="text/javascript" src="https://gc.kis.v2.scr.kaspersky-labs.com/FD126C42-EBFA-4E12-B309-BB3FDD723AC1/main.js?attr=fSq2j_cB8WcWU0hbB-EoVmXyQSAtZOlzBGz9V0p1e7FbNNJ7t0JVVTtSGWgI5zzi5Q-LFTnG9sqMAAcdRD4uyR0Ofooq0AETxxNf0Xe4DtbKqm-m4dcx8Q-HpKPyrBJCSheeSSkG1m5BvtvG3dLLE0BqmppxSH3wdQenKGy9e691cOEyjeVJZ1cllB7fq-bCXJQOnOgMDJpwtk6j62CbnA" charset="UTF-8"></script><style>
+<script type="text/javascript" src="https://gc.kis.v2.scr.kaspersky-labs.com/FD126C42-EBFA-4E12-B309-BB3FDD723AC1/main.js?attr=If5OZzTWPG0sCH3WPij3ue57fWQaOJ96GlTIlPrYbuzP6S0EbhUipwtgWOwQRo_AGgKhka8Yj_lrsSVX1GZtpBC99yJYKEM0TpUNZYIsUDWCKYS_73O0zXWnyHsZrYtUa9LjWZn2X6QHjnCU2cFmi_6Pakbyh_3-gJTtaW9S6f_6Z_OdN0PpWVJsVicmWhK0926BRRlDA1BWKJShBbhTqA" charset="UTF-8"></script><style>
 
 :root{color-scheme:dark;--bg:#080e14;--panel:#101923;--panel2:#0c151e;--line:#233442;--text:#edf3f7;--muted:#91a3b2;--blue:#3b9cff;--green:#48d6a0;--red:#ff6574;--gold:#ffc66d}
 *{box-sizing:border-box}
@@ -60,7 +60,6 @@ p{color:#b5c4ce}.hero p{margin-bottom:0}
 <nav id="bottomnav" class="bottomnav" aria-label="Основная навигация"></nav>
 <div id="toastRoot" aria-live="polite"></div>
 <div id="modalRoot"></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* ============================================================
    НАСТРОЙКА SUPABASE
@@ -69,10 +68,45 @@ const SUPABASE_URL = 'https://rmkpevcckejtpkopokhr.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_6n4DaH1i5cGXS6XWQ2AAtQ_ON63yV59';
 
 let sb = null;
-try {
-  if (typeof supabase === 'undefined') console.error('Supabase JS не загружен');
-  else sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-} catch (e) { console.error('Ошибка Supabase:', e); }
+
+// Загружаем Supabase неблокирующим способом: если один CDN недоступен,
+// пробуем резервный. Это не позволяет странице зависнуть на пустом экране.
+function loadScriptWithTimeout(src, timeoutMs=9000){
+  return new Promise((resolve,reject)=>{
+    const script=document.createElement('script');
+    let finished=false;
+    const timer=setTimeout(()=>{
+      if(finished)return; finished=true; script.remove();
+      reject(new Error('Тайм-аут загрузки библиотеки: '+src));
+    },timeoutMs);
+    script.src=src;
+    script.async=true;
+    script.onload=()=>{if(finished)return;finished=true;clearTimeout(timer);resolve()};
+    script.onerror=()=>{if(finished)return;finished=true;clearTimeout(timer);script.remove();reject(new Error('Не удалось загрузить библиотеку: '+src))};
+    document.head.appendChild(script);
+  });
+}
+async function initializeSupabase(){
+  if(typeof supabase==='undefined'){
+    const cdns=[
+      'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2',
+      'https://unpkg.com/@supabase/supabase-js@2'
+    ];
+    let lastError=null;
+    for(const url of cdns){
+      try{await loadScriptWithTimeout(url);if(typeof supabase!=='undefined')break;}
+      catch(e){lastError=e;}
+    }
+    if(typeof supabase==='undefined')throw (lastError||new Error('Библиотека Supabase недоступна'));
+  }
+  sb=supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY,{
+    auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}
+  });
+  return sb;
+}
+function withTimeout(promise,ms,label){
+  return Promise.race([promise,new Promise((_,reject)=>setTimeout(()=>reject(new Error(label||'Превышено время ожидания')),ms))]);
+}
 
 const ROLE_LABELS = {
   panel_admin:  'Админ панели',
@@ -909,49 +943,53 @@ async function deleteAccount(id){
 const REQUIRED_TABLES = ['accounts','staff','info_messages','logs'];
 
 async function checkSchema(){
-  if(!sb)return {ok:false, missing:REQUIRED_TABLES, connection:true};
-  const missing=[];
-  for(const t of REQUIRED_TABLES){
+  if(!sb)return {ok:false,missing:[],connection:true,message:'Клиент Supabase не создан'};
+  const results=await Promise.all(REQUIRED_TABLES.map(async t=>{
     const {error}=await sb.from(t).select('*',{count:'exact',head:true});
-    if(error){
-      if(/schema cache|does not exist|not found|could not find the table/i.test(error.message)) missing.push(t);
-      else return {ok:false, missing:[], connection:true, message:error.message};
-    }
+    return {table:t,error};
+  }));
+  const missing=[];
+  for(const {table,error} of results){
+    if(!error)continue;
+    if(/schema cache|does not exist|not found|could not find the table|relation .* does not exist/i.test(error.message||'')) missing.push(table);
+    else return {ok:false,missing:[],connection:true,message:error.message||'Ошибка запроса к Supabase'};
   }
-  return {ok:missing.length===0, missing};
+  return {ok:missing.length===0,missing};
 }
 
-function showSchemaErrorScreen(missing){
+function showStartupError(message){
   document.getElementById('app').innerHTML=`
     <div class="empty" style="max-width:640px;margin:40px auto;text-align:left">
-      <strong style="font-size:18px;color:#ff8790">⚠ База данных не готова</strong>
-      <p style="margin:14px 0 8px">Supabase не видит таблицы:</p>
-      <code style="display:block;background:#29161c;padding:10px;border-radius:8px;color:#ffb0b5;margin-bottom:14px">
-        ${missing.map(t=>'public.'+t).join('<br>')}
-      </code>
-      <p style="margin:14px 0 8px"><b>Что делать:</b></p>
-      <ol style="padding-left:20px;color:#c6d3dc;line-height:1.9">
-        <li>Supabase → <b>SQL Editor</b> → выполни SQL из чата.</li>
-        <li>Убедись, что в конце есть <code style="background:#0b1219;padding:2px 6px;border-radius:5px">notify pgrst, 'reload schema';</code></li>
-        <li>Подожди 10 секунд → <button class="btn small primary" onclick="location.reload()">Перезагрузить</button></li>
-      </ol>
+      <strong style="font-size:18px;color:#ff8790">Не удалось загрузить данные</strong>
+      <p>${esc(message)}</p>
+      <p style="color:var(--muted)">Проверьте подключение и попробуйте ещё раз.</p>
+      <button class="btn primary" onclick="location.reload()">Повторить загрузку</button>
     </div>`;
 }
 
 (async function init(){
-  session = loadSession();
-  if(session) await reloadSession();
+  // Сразу показываем интерфейс, не ожидая сетевых запросов.
+  document.getElementById('app').innerHTML='<div class="empty">Подключение к базе данных…</div>';
+  session=loadSession();
   renderTopbar();
   renderBottomnav();
-  document.getElementById('app').innerHTML = '<div class="empty">Проверка базы данных…</div>';
-  const schema = await checkSchema();
-  if(!schema.ok){
-    if(schema.connection && !schema.missing.length){
-      document.getElementById('app').innerHTML='<div class="empty"><strong>Не удалось подключиться к базе данных</strong>'+esc(schema.message||'Проверьте URL, ключ Supabase, интернет и настройки доступа (RLS).')+'</div>';
-    } else showSchemaErrorScreen(schema.missing);
-    return;
+  try{
+    await withTimeout(initializeSupabase(),20000,'Не удалось загрузить библиотеку Supabase за 20 секунд.');
+    const schema=await withTimeout(checkSchema(),18000,'Сервер базы данных не ответил за 18 секунд.');
+    if(!schema.ok){
+      if(schema.connection&&!schema.missing.length)showStartupError(schema.message||'Ошибка подключения к Supabase.');
+      else showSchemaErrorScreen(schema.missing);
+      return;
+    }
+    if(session){
+      await withTimeout(reloadSession(),8000,'Не удалось обновить сессию');
+      renderTopbar();
+    }
+    showView('home');
+  }catch(e){
+    console.error('Ошибка запуска приложения:',e);
+    showStartupError(e&&e.message?e.message:'Неизвестная ошибка запуска');
   }
-  showView('home');
 })();
 </script>
 </body>
